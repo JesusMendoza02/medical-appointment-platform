@@ -8,6 +8,7 @@ from typing import Optional
 from sqlalchemy import select
 from datetime import datetime
 from sqlalchemy.orm import selectinload, joinedload
+from langgraph.checkpoint.memory import MemorySaver
 
 # Importamos la sesión de base de datos y los modelos
 from app.database import AsyncSessionLocal
@@ -118,18 +119,22 @@ async def get_appointments_by_status(status: str) -> str:
 
         return f"Citas con el estado '{status}':\n" + "\n".join(appointments_list)
 
+
 @tool
 async def create_appointment(patient_name: str, doctor_id: int, appointment_date: str, notes: Optional[str] = None) -> str:
     """Agendar nuevas citas y valida que no existan citas dobles y que la fecha no sea menor a la fecha actual."""
     async with AsyncSessionLocal() as session:
-        fecha = datetime.strptime(appointment_date, "%Y-%m-%d %H:%M")
+        try:
+            fecha = datetime.strptime(appointment_date, "%Y-%m-%d %H:%M")
+        except ValueError:
+            return "Formato de fecha inválido. Utiliza el formato: YYYY-MM-DD HH:MM"
 
         stmt = select(Doctor).where(Doctor.id == doctor_id)
         result = await session.execute(stmt)
         doctor = result.scalar_one_or_none()
 
         stmt = select(AppointmentRegister).where((
-            AppointmentRegister.appointment_date == fecha) & (AppointmentRegister.doctor_id == doctor_id))                       
+            AppointmentRegister.appointment_date == fecha) & (AppointmentRegister.doctor_id == doctor_id))                     
         result = await session.execute(stmt)
         fecha_ocupada = result.scalar_one_or_none()
 
@@ -156,18 +161,81 @@ async def create_appointment(patient_name: str, doctor_id: int, appointment_date
         return f"Cita creada exitosamente: Paciente {patient_name} | Fecha {appointment_date} | Doctor {doctor.name}"
 
 
+@tool 
+async def cancel_appointment(appointment_id: int) -> str:
+    """Cancelar una cita por ID."""
+    async with AsyncSessionLocal() as session:
+        stmt = select(AppointmentRegister).where(AppointmentRegister.id == appointment_id).options(joinedload(AppointmentRegister.doctor))
+        result = await session.execute(stmt)
+        appointment = result.scalar_one_or_none()
+
+        if not appointment:
+            return f"No existe la cita con ID {appointment_id}"
+
+        if appointment.status == Status.CANCELLED:
+            return f"La cita con ID {appointment_id} ya se encuentra cancelada"
+
+        if appointment.status == Status.COMPLETED:
+            return f"No se puede cancelar la cita con ID {appointment_id} porque ya se encuentra completada"
+        
+        doctor_name = appointment.doctor.name
+        appointment.status = Status.CANCELLED
+        await session.commit()
+        await session.refresh(appointment)
+
+        return f"Cita cancelada exitosamente: Paciente {appointment.patient_name} | Fecha {appointment.appointment_date} | Doctor {doctor_name}"
+
 
 @tool 
-async def cancel_appointment() -> str:
-    pass
+async def reschedule_appointment(appointment_id: int, new_date: str) -> str:
+    """Reagendar cita por ID y nueva fecha"""
+    async with AsyncSessionLocal() as session:
+        try:
+            fecha = datetime.strptime(new_date, "%Y-%m-%d %H:%M")
+        except ValueError:
+            return "Formato de fecha inválido. Utiliza el formato: YYYY-MM-DD HH:MM"
+
+        if fecha <= datetime.now():
+            return f"No se puede reagendar la cita porque la nueva fecha es menor a la fecha actual, ingresa una fecha mayor a la fecha actual"
+
+        stmt = select(AppointmentRegister).where(AppointmentRegister.id == appointment_id).options(joinedload(AppointmentRegister.doctor))
+        result = await session.execute(stmt)
+        appointment = result.scalar_one_or_none()
+
+        if not appointment:
+            return f"No existe la cita con ID {appointment_id}"
+
+        if appointment.status == Status.CANCELLED:
+            return f"No se puede reagendar la cita con ID {appointment_id} porque ya se encuentra cancelada"
+
+        if appointment.status == Status.COMPLETED:
+            return f"No se puede reagendar la cita con ID {appointment_id} porque ya se encuentra completada, agenda una nueva cita"
+        
+        doctor_name = appointment.doctor.name
+        appointment.appointment_date = fecha
+        await session.commit()
+        await session.refresh(appointment)
+
+        return f"Cita reagendada exitosamente: Paciente {appointment.patient_name} | Nueva Fecha {appointment.appointment_date} | Doctor {doctor_name}"
+
 
 @tool 
-async def reschedule_appointment() -> str:
-    pass
+async def update_appointments_notes(appointment_id: int, notes: str) -> str:
+    """Actualizar notas de una cita por ID"""
+    async with AsyncSessionLocal() as session:
+        stmt = select(AppointmentRegister).where(AppointmentRegister.id == appointment_id)
+        result = await session.execute(stmt)
+        appointment = result.scalar_one_or_none()
 
-@tool 
-async def update_appointments_notes() -> str:
-    pass
+        if not appointment:
+            return f"No existe la cita con ID {appointment_id}"
+
+        appointment.notes = notes
+        await session.commit()
+        await session.refresh(appointment)
+
+        return f"Notas actualizadas exitosamente: Paciente {appointment.patient_name} | Notas {appointment.notes}"
+
 
 # --- Configuración del agente ---
 
@@ -200,19 +268,25 @@ system_prompt = (
     "3. Ordena los resultados por fecha según lo solicite el usuario."
 )
 
+memory = MemorySaver()
+
 agent_executor = create_react_agent(
     model=llm,
     tools=tools,
     prompt=system_prompt,
+    checkpointer=memory,
 )
 
 
-async def run_agent_chat(user_message: str) -> str:
+async def run_agent_chat(user_message: str, session_id: str = "default_session") -> str:
     """Procesa el mensaje del usuario con el agente y devuelve la respuesta final en texto."""
     inputs = {"messages": [("user", user_message)]}
 
-    # Invocamos el agente de forma asíncrona
-    response = await agent_executor.ainvoke(inputs)
+    # Configuración obligatoria para que el MemorySaver sepa a qué chat pertenece
+    config = {"configurable": {"thread_id": session_id}}
+
+    # Invocamos el agente pasando el config y la memoria
+    response = await agent_executor.ainvoke(inputs, config=config)
 
     # Extraemos el último mensaje generado por el asistente
     final_message = response["messages"][-1].content
